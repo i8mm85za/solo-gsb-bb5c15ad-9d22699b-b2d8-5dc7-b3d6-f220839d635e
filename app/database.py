@@ -57,6 +57,42 @@ CREATE TABLE IF NOT EXISTS alignments (
 
 CREATE INDEX IF NOT EXISTS idx_paragraphs_doc ON paragraphs(document_id, side, idx);
 CREATE INDEX IF NOT EXISTS idx_alignments_doc ON alignments(document_id);
+
+-- 引用检查：每个文档一条扫描汇总
+CREATE TABLE IF NOT EXISTS citation_checks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id  INTEGER NOT NULL UNIQUE REFERENCES documents(id) ON DELETE CASCADE,
+    total        INTEGER NOT NULL DEFAULT 0,
+    n_ok         INTEGER NOT NULL DEFAULT 0,
+    n_missing    INTEGER NOT NULL DEFAULT 0,
+    n_ambiguous  INTEGER NOT NULL DEFAULT 0,
+    scanned_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 引用检查：每条“第X条 / 本条前款 …”引用一行
+CREATE TABLE IF NOT EXISTS citation_issues (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id      INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    order_idx        INTEGER NOT NULL,          -- 文档内扫描顺序
+    source_para_idx  INTEGER NOT NULL,          -- 来源新版段落（0 基）
+    source_start     INTEGER NOT NULL,          -- 引用在来源段落中的字符偏移
+    source_end       INTEGER NOT NULL,
+    mention_text     TEXT    NOT NULL,          -- 引用原文，如“第十条第二款”
+    ref_type         TEXT    NOT NULL,          -- 引用类型（见 citations.REF_TYPE_LABEL）
+    article_no       INTEGER,                   -- 解析出的绝对条号（若有）
+    kuan_no          INTEGER,
+    xiang_no         INTEGER,
+    relative         TEXT,                      -- 相对指代种类（this/prekuan/…）
+    status           TEXT    NOT NULL CHECK (status IN ('ok', 'missing', 'ambiguous')),
+    target_label     TEXT    NOT NULL DEFAULT '',  -- 唯一定位目标标签（ok）
+    target_excerpt   TEXT    NOT NULL DEFAULT '',  -- 唯一定位目标原文（ok）
+    source_location  TEXT    NOT NULL DEFAULT '',  -- 人类可读来源位置
+    reason           TEXT    NOT NULL DEFAULT '',  -- 定位说明 / 缺失或歧义原因
+    targets_json     TEXT    NOT NULL DEFAULT '[]', -- 唯一目标单元 [{label,excerpt,...}]
+    candidates_json  TEXT    NOT NULL DEFAULT '[]'  -- 多候选（ambiguous，绝不静默选取）
+);
+
+CREATE INDEX IF NOT EXISTS idx_citations_doc ON citation_issues(document_id, status);
 """
 
 
@@ -101,4 +137,13 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     d["new_indices"] = str_to_indices(d.pop("new_indices") or "")
     d["is_manual"] = bool(d["is_manual"])
     d["similarity"] = d["similarity"]
+    return d
+
+
+def citation_row_to_dict(row: sqlite3.Row) -> dict:
+    """citation_issues 行 → API 响应 dict（解析 JSON 字段）。"""
+    import json
+    d = dict(row)
+    d["targets"] = json.loads(d.pop("targets_json") or "[]")
+    d["candidates"] = json.loads(d.pop("candidates_json") or "[]")
     return d

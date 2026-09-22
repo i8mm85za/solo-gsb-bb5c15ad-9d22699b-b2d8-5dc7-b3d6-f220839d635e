@@ -18,7 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import database as dbmod
 from .aligner import align, manual_record, split_paragraphs
-from .database import db, indices_to_str, row_to_dict
+from .citations import REF_TYPE_LABEL, scan_citations
+from .database import db, citation_row_to_dict, indices_to_str, row_to_dict
 from .schemas import (
     AlignmentCreate,
     AlignmentPatch,
@@ -51,6 +52,42 @@ DECISIONS = {
     "disputed": "有异议",
     "ignored": "忽略",
 }
+CITATION_STATUS = {"ok": "正常", "missing": "缺失", "ambiguous": "歧义"}
+
+
+def _run_citation_scan(conn, doc_id: int) -> dict:
+    """扫描新版段落引用并全量替换该文档的引用检查结果，返回统计。"""
+    new = [r[0] for r in conn.execute(
+        "SELECT content FROM paragraphs WHERE document_id=? AND side='new' ORDER BY idx",
+        (doc_id,)).fetchall()]
+    records = scan_citations(new)
+    conn.execute("DELETE FROM citation_issues WHERE document_id=?", (doc_id,))
+    conn.execute("DELETE FROM citation_checks WHERE document_id=?", (doc_id,))
+    for r in records:
+        conn.execute(
+            """INSERT INTO citation_issues
+               (document_id, order_idx, source_para_idx, source_start, source_end,
+                mention_text, ref_type, article_no, kuan_no, xiang_no, relative,
+                status, target_label, target_excerpt, source_location, reason,
+                targets_json, candidates_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (doc_id, r["order_idx"], r["source_para_idx"], r["source_start"], r["source_end"],
+             r["mention_text"], r["ref_type"], r["article_no"], r["kuan_no"], r["xiang_no"],
+             r["relative"], r["status"], r["target_label"], r["target_excerpt"],
+             r["source_location"], r["reason"],
+             json.dumps(r["targets"], ensure_ascii=False),
+             json.dumps(r["candidates"], ensure_ascii=False)),
+        )
+    counts = {"ok": 0, "missing": 0, "ambiguous": 0}
+    for r in records:
+        counts[r["status"]] += 1
+    conn.execute(
+        """INSERT INTO citation_checks (document_id, total, n_ok, n_missing, n_ambiguous, scanned_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+        (doc_id, len(records), counts["ok"], counts["missing"], counts["ambiguous"]),
+    )
+    return {"total": len(records), "n_ok": counts["ok"],
+            "n_missing": counts["missing"], "n_ambiguous": counts["ambiguous"]}
 
 
 @app.on_event("startup")
@@ -93,7 +130,8 @@ def create_document(payload: DocumentCreate):
                  json.dumps(r["diff_ops"], ensure_ascii=False)),
             )
         conn.execute("UPDATE documents SET aligned_at = datetime('now') WHERE id = ?", (doc_id,))
-    return {"id": doc_id, "aligned": len(records)}
+        cit = _run_citation_scan(conn, doc_id)
+    return {"id": doc_id, "aligned": len(records), "citations": cit}
 
 
 @app.get("/api/documents")
@@ -104,7 +142,9 @@ def list_documents():
                       (SELECT COUNT(*) FROM paragraphs p WHERE p.document_id=d.id AND p.side='old') AS n_old,
                       (SELECT COUNT(*) FROM paragraphs p WHERE p.document_id=d.id AND p.side='new') AS n_new,
                       (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id) AS n_align,
-                      (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id AND a.decision!='pending') AS n_reviewed
+                      (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id AND a.decision!='pending') AS n_reviewed,
+                      (SELECT COALESCE(SUM(1),0) FROM citation_issues c WHERE c.document_id=d.id AND c.status!='ok') AS n_cit_issues,
+                      (SELECT COALESCE(SUM(1),0) FROM citation_issues c WHERE c.document_id=d.id) AS n_cit_total
                FROM documents d ORDER BY d.created_at DESC, d.id DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
@@ -128,6 +168,9 @@ def get_document(doc_id: int):
         aligns = conn.execute(
             "SELECT * FROM alignments WHERE document_id=? ORDER BY id", (doc_id,)
         ).fetchall()
+        cit_check = conn.execute(
+            "SELECT * FROM citation_checks WHERE document_id=?", (doc_id,)
+        ).fetchone()
     paragraphs = {"old": [], "new": []}
     for p in paras:
         paragraphs[p["side"]].append({"idx": p["idx"], "content": p["content"]})
@@ -138,6 +181,7 @@ def get_document(doc_id: int):
         a = row_to_dict(r)
         a["diff_ops"] = json.loads(r["diff_ops"] or "[]")
         result["alignments"].append(a)
+    result["citation_check"] = dict(cit_check) if cit_check else None
     return result
 
 
@@ -321,6 +365,136 @@ def realign(doc_id: int):
             )
         conn.execute("UPDATE documents SET aligned_at=datetime('now') WHERE id=?", (doc_id,))
     return {"detail": "已重新对齐", "count": len(records)}
+
+
+# ---------------- 引用检查 ----------------
+
+@app.post("/api/documents/{doc_id}/citations/scan", status_code=201)
+def rescan_citations(doc_id: int):
+    """重新扫描新版条款引用（幂等全量替换）。"""
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        stats = _run_citation_scan(conn, doc_id)
+    return {"detail": "已重新扫描引用", **stats}
+
+
+def _filtered_citations(conn, doc_id: int, status: str | None,
+                        ref_type: str | None, keyword: str | None) -> list[dict]:
+    sql = "SELECT * FROM citation_issues WHERE document_id=?"
+    params: list = [doc_id]
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    if ref_type:
+        sql += " AND ref_type=?"
+        params.append(ref_type)
+    if keyword:
+        sql += " AND (mention_text LIKE ? OR reason LIKE ? OR target_label LIKE ?)"
+        like = f"%{keyword}%"
+        params.extend([like, like, like])
+    sql += " ORDER BY order_idx, id"
+    return [citation_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+@app.get("/api/documents/{doc_id}/citations")
+def list_citations(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(ok|missing|ambiguous)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """列出文档的引用检查记录，可按检查状态/引用类型/关键字筛选。
+
+    每条含来源段落与字符偏移、引用原文、检查状态、唯一目标（targets）
+    或多候选（candidates）及原因；``missing/ambiguous`` 不含 targets，
+    绝不静默选取。
+    """
+    with db() as conn:
+        doc = _get_doc_or_404(conn, doc_id)
+        title = doc["title"]
+        new_paras = [r[0] for r in conn.execute(
+            "SELECT content FROM paragraphs WHERE document_id=? AND side='new' ORDER BY idx",
+            (doc_id,)).fetchall()]
+        check = conn.execute(
+            "SELECT * FROM citation_checks WHERE document_id=?", (doc_id,)
+        ).fetchone()
+        rows = _filtered_citations(conn, doc_id, status, ref_type, keyword)
+    return {
+        "document_id": doc_id,
+        "title": title,
+        "check": dict(check) if check else None,
+        "new_paragraphs": new_paras,
+        "ref_type_labels": REF_TYPE_LABEL,
+        "items": rows,
+    }
+
+
+@app.get("/api/documents/{doc_id}/citations/{issue_id}")
+def get_citation(doc_id: int, issue_id: int):
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        row = conn.execute(
+            "SELECT * FROM citation_issues WHERE id=? AND document_id=?",
+            (issue_id, doc_id)).fetchone()
+        if row is None:
+            raise HTTPException(404, "引用记录不存在")
+        item = citation_row_to_dict(row)
+        src = conn.execute(
+            "SELECT idx, content FROM paragraphs WHERE document_id=? AND side='new' AND idx=?",
+            (doc_id, item["source_para_idx"])).fetchone()
+    item["source_para"] = None if src is None else {"idx": src["idx"], "content": src["content"]}
+    return item
+
+
+@app.get("/api/documents/{doc_id}/citations-export")
+def export_citations(
+    doc_id: int,
+    status: str | None = Query(None, pattern="^(ok|missing|ambiguous)$"),
+    ref_type: str | None = None,
+    keyword: str | None = None,
+):
+    """导出引用问题 CSV（UTF-8 BOM，Excel 可直接打开）。
+
+    默认仅导出问题项（缺失/歧义）；传 ``status=ok`` 可包含正常项。
+    每行含来源位置、引用原文、引用类型、检查状态、目标/候选原文与原因。
+    """
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        rows = _filtered_citations(conn, doc_id, status, ref_type, keyword)
+    if status is None:
+        rows = [r for r in rows if r["status"] != "ok"]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["序号", "检查状态", "来源位置", "来源新版段落号",
+                     "引用原文", "引用类型", "条号", "款号", "项号", "相对指代",
+                     "定位目标", "目标原文", "候选数", "候选原文", "判定说明"])
+    for i, r in enumerate(rows, 1):
+        candidates = r["candidates"]
+        cand_excerpt = "\n---\n".join(
+            f"[{c.get('label', '候选')}｜新版第 {c['para_idx']+1} 段]\n{c['excerpt']}"
+            for c in candidates)
+        writer.writerow([
+            i,
+            CITATION_STATUS[r["status"]],
+            r["source_location"],
+            r["source_para_idx"] + 1,
+            r["mention_text"],
+            REF_TYPE_LABEL.get(r["ref_type"], r["ref_type"]),
+            r["article_no"] if r["article_no"] is not None else "",
+            r["kuan_no"] if r["kuan_no"] is not None else "",
+            r["xiang_no"] if r["xiang_no"] is not None else "",
+            r["relative"] or "",
+            r["target_label"],
+            r["target_excerpt"],
+            len(candidates),
+            cand_excerpt,
+            r["reason"],
+        ])
+    data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
+    fname = f"regreview-citations-{doc_id}-{stamp}.csv"
+    return Response(content=data, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 
 # ---------------- 导出 ----------------

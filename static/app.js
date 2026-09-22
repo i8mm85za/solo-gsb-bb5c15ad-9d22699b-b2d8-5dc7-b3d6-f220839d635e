@@ -8,10 +8,16 @@ const TYPE_LABEL = {
 const DECISION_LABEL = {
   pending: "待审阅", confirmed: "确认", disputed: "有异议", ignored: "忽略",
 };
+const CITE_STATUS_LABEL = { ok: "正常", missing: "缺失", ambiguous: "歧义" };
 
 const state = {
   view: "list",           // list | upload | workspace
+  tab: "align",           // align | citations
   doc: null,              // 当前文档详情
+  cit: null,              // 引用检查数据 {check, items, new_paragraphs, ref_type_labels}
+  citStatus: "",          // 引用检查状态筛选 ok|missing|ambiguous
+  citType: "",            // 引用类型筛选
+  citKw: "",              // 引用关键字
   filterType: "",         // 变更类型筛选
   filterDecision: "",     // 决定筛选
   search: "",
@@ -90,6 +96,9 @@ async function renderList() {
                 h("span", {}, `新版 ${d.n_new} 段`),
                 h("span", {}, `对齐 ${d.n_align} 条`),
                 h("span", {}, `已审阅 ${d.n_reviewed}/${d.n_align}`),
+                d.n_cit_issues > 0
+                  ? h("span", { class: "cit-warn" }, `⚠ 引用问题 ${d.n_cit_issues}/${d.n_cit_total}`)
+                  : (d.n_cit_total > 0 ? h("span", { class: "cit-ok" }, `引用检查 ${d.n_cit_total} 项无误`) : null),
                 h("span", {}, `创建于 ${fmtTime(d.created_at)}`))),
             h("button", {
               class: "btn danger sm",
@@ -162,6 +171,11 @@ async function openDoc(id) {
   try {
     state.doc = await api(`/api/documents/${id}`);
   } catch (e) { return toast(e.message, true); }
+  state.tab = "align";
+  state.cit = null;
+  state.citStatus = "";
+  state.citType = "";
+  state.citKw = "";
   state.filterType = "";
   state.filterDecision = "";
   state.search = "";
@@ -177,21 +191,39 @@ function typeCounts() {
   return c;
 }
 
+async function loadCitations() {
+  try {
+    state.cit = await api(`/api/documents/${state.doc.id}/citations`);
+  } catch (e) { toast(e.message, true); state.cit = null; }
+}
+
+async function switchTab(tab) {
+  state.tab = tab;
+  if (tab === "citations" && !state.cit) await loadCitations();
+  renderWorkspace();
+}
+
 function renderWorkspace() {
   const d = state.doc;
   $app.innerHTML = "";
 
-  const counts = typeCounts();
   const reviewed = d.alignments.filter(a => a.decision !== "pending").length;
+  const cc = d.citation_check;
+  const nIssues = cc ? cc.n_missing + cc.n_ambiguous : 0;
 
-  // 统计 chips（点击按类型筛选）；圆点颜色由 CSS 类控制
-  const chips = Object.entries(TYPE_LABEL).map(([key, label]) => {
-    const n = counts[key] || 0;
-    return h("span", {
-      class: `chip clickable ${key} ${state.filterType === key ? "" : "off"}`,
-      onclick: () => { state.filterType = state.filterType === key ? "" : key; renderWorkspace(); },
-    }, h("span", { class: "dot" }), `${label} ${n}`);
-  });
+  const tabbar = h("div", { class: "tabs" },
+    h("button", {
+      class: `tab ${state.tab === "align" ? "active" : ""}`,
+      onclick: () => switchTab("align"),
+    }, "条款对齐", h("span", { class: "tab-count" }, d.alignments.length)),
+    h("button", {
+      class: `tab ${state.tab === "citations" ? "active" : ""}`,
+      onclick: () => switchTab("citations"),
+    }, "引用检查",
+      cc
+        ? h("span", { class: `tab-count ${nIssues ? "warn" : "ok"}` },
+            nIssues ? `问题 ${nIssues}` : `${cc.total} 项无误`)
+        : h("span", { class: "tab-count" }, "未扫描")));
 
   const head = h("div", { class: "panel" },
     h("div", { class: "breadcrumb", onclick: renderList }, "← 返回文档列表"),
@@ -208,21 +240,43 @@ function renderWorkspace() {
         h("button", { class: "btn sm", onclick: () => openNewMapping() }, "＋ 新建映射"),
         h("button", { class: "btn sm", onclick: () => realign(d.id) }, "↻ 重新自动对齐"),
         exportMenu(d.id))),
-    h("div", { class: "stats" }, chips),
-    h("div", { class: "toolbar" },
-      h("input", {
-        type: "text", placeholder: "搜索原文 / 备注关键字…", value: state.search,
-        oninput: (e) => { state.search = e.target.value; applyListFilter(); },
-      }),
-      h("select", {
-        onchange: (e) => { state.filterDecision = e.target.value; renderWorkspace(); },
-      },
-        h("option", { value: "" }, "全部审阅状态"),
-        ...Object.entries(DECISION_LABEL).map(([v, l]) =>
-          h("option", { value: v, selected: state.filterDecision === v }, l))),
-      h("span", { class: "foot-label", id: "visible-count" })));
+    tabbar);
 
   $app.append(head);
+  if (state.tab === "align") renderAlignTab();
+  else renderCitationsTab();
+}
+
+// ---------------- 对齐 Tab ----------------
+
+function renderAlignTab() {
+  const d = state.doc;
+  const counts = typeCounts();
+
+  // 统计 chips（点击按类型筛选）；圆点颜色由 CSS 类控制
+  const chips = Object.entries(TYPE_LABEL).map(([key, label]) => {
+    const n = counts[key] || 0;
+    return h("span", {
+      class: `chip clickable ${key} ${state.filterType === key ? "" : "off"}`,
+      onclick: () => { state.filterType = state.filterType === key ? "" : key; renderWorkspace(); },
+    }, h("span", { class: "dot" }), `${label} ${n}`);
+  });
+
+  $app.append(
+    h("div", { class: "panel tab-panel" },
+      h("div", { class: "stats" }, chips),
+      h("div", { class: "toolbar" },
+        h("input", {
+          type: "text", placeholder: "搜索原文 / 备注关键字…", value: state.search,
+          oninput: (e) => { state.search = e.target.value; applyListFilter(); },
+        }),
+        h("select", {
+          onchange: (e) => { state.filterDecision = e.target.value; renderWorkspace(); },
+        },
+          h("option", { value: "" }, "全部审阅状态"),
+          ...Object.entries(DECISION_LABEL).map(([v, l]) =>
+            h("option", { value: v, selected: state.filterDecision === v }, l))),
+        h("span", { class: "foot-label", id: "visible-count" }))));
 
   const list = h("div", { id: "alignment-list" });
   d.alignments.forEach(a => list.appendChild(renderCard(a)));
@@ -265,8 +319,224 @@ async function realign(id) {
   try {
     await api(`/api/documents/${id}/realign`, { method: "POST" });
     toast("已重新对齐");
+    state.cit = null;
     openDoc(id);
   } catch (e) { toast(e.message, true); }
+}
+
+// ---------------- 引用检查 Tab ----------------
+
+async function rescanCitations() {
+  const id = state.doc.id;
+  try {
+    const stats = await api(`/api/documents/${id}/citations/scan`, { method: "POST" });
+    state.doc.citation_check = {
+      total: stats.total, n_ok: stats.n_ok,
+      n_missing: stats.n_missing, n_ambiguous: stats.n_ambiguous,
+    };
+    state.cit = null;
+    await loadCitations();
+    renderWorkspace();
+    toast(`扫描完成：共 ${stats.total} 项，缺失 ${stats.n_missing}，歧义 ${stats.n_ambiguous}`);
+  } catch (e) { toast(e.message, true); }
+}
+
+function filteredCitationItems() {
+  const items = state.cit ? state.cit.items : [];
+  const kw = state.citKw.trim().toLowerCase();
+  return items.filter(it => {
+    if (state.citStatus && it.status !== state.citStatus) return false;
+    if (state.citType && it.ref_type !== state.citType) return false;
+    if (kw && !(it.mention_text + it.reason + it.target_label + it.source_location)
+        .toLowerCase().includes(kw)) return false;
+    return true;
+  });
+}
+
+function renderCitationsTab() {
+  if (!state.cit) {
+    $app.append(h("div", { class: "panel" },
+      h("div", { class: "empty" }, "引用检查数据加载中……")));
+    return;
+  }
+  const cit = state.cit;
+  const cc = cit.check;
+  const nIssues = cc ? cc.n_missing + cc.n_ambiguous : 0;
+
+  // 状态筛选 chips
+  const chips = [
+    { key: "", label: `全部 ${cc ? cc.total : 0}` },
+    { key: "missing", label: `缺失 ${cc ? cc.n_missing : 0}` },
+    { key: "ambiguous", label: `歧义 ${cc ? cc.n_ambiguous : 0}` },
+    { key: "ok", label: `正常 ${cc ? cc.n_ok : 0}` },
+  ].map(c => h("span", {
+    class: `chip clickable cit-chip ${c.key || "all"} ${state.citStatus === c.key ? "" : "off"}`,
+    onclick: () => { state.citStatus = c.key; renderWorkspace(); },
+  }, h("span", { class: "dot" }), c.label));
+
+  // 引用类型去重（出现过的类型）
+  const typeSet = [...new Set(cit.items.map(x => x.ref_type))];
+
+  const panel = h("div", { class: "panel tab-panel" },
+    h("div", { class: "cit-headline" },
+      cc
+        ? h("div", {},
+            h("b", {}, `扫描到 ${cc.total} 处引用`),
+            h("span", { class: nIssues ? "cit-warn" : "cit-ok" },
+              nIssues ? `　⚠ ${nIssues} 处需处理（缺失 ${cc.n_missing} · 歧义 ${cc.n_ambiguous}），不会静默选取目标`
+                      : "　✔ 全部引用均可唯一定位"))
+        : h("div", { class: "hint" }, "尚未生成引用检查结果"),
+      h("div", { class: "actions", style: "margin:0" },
+        h("button", { class: "btn sm", onclick: rescanCitations }, "↻ 重新扫描"),
+        h("button", { class: "btn primary sm", onclick: exportCitations }, "⬇ 导出问题 CSV"))),
+    h("div", { class: "stats" }, chips),
+    h("div", { class: "toolbar" },
+      h("input", {
+        type: "text", placeholder: "搜索引用原文 / 目标 / 原因…", value: state.citKw,
+        oninput: (e) => { state.citKw = e.target.value; applyCitationFilter(); },
+      }),
+      h("select", {
+        onchange: (e) => { state.citType = e.target.value; renderWorkspace(); },
+      },
+        h("option", { value: "" }, "全部引用类型"),
+        ...typeSet.map(t => h("option", {
+          value: t, selected: state.citType === t,
+        }, (cit.ref_type_labels && cit.ref_type_labels[t]) || t))),
+      h("span", { class: "foot-label", id: "cit-visible-count" })));
+
+  const list = h("div", { id: "citation-list" });
+  filteredCitationItems().forEach(it => list.appendChild(renderCitationCard(it)));
+  if (!list.children.length) {
+    list.append(h("div", { class: "empty" }, "当前筛选条件下没有引用记录"));
+  }
+  $app.append(panel, list);
+  applyCitationFilter();
+}
+
+function exportCitations() {
+  const p = new URLSearchParams();
+  if (state.citStatus) p.set("status", state.citStatus);
+  if (state.citType) p.set("ref_type", state.citType);
+  if (state.citKw.trim()) p.set("keyword", state.citKw.trim());
+  // 默认（无状态筛选）时后端只导出问题项；导出全部需显式选“正常/缺失/歧义”
+  const qs = p.toString();
+  window.location.href = `/api/documents/${state.doc.id}/citations-export${qs ? "?" + qs : ""}`;
+}
+
+function applyCitationFilter() {
+  const n = filteredCitationItems().length;
+  const total = state.cit ? state.cit.items.length : 0;
+  const el = document.getElementById("cit-visible-count");
+  if (el) el.textContent = `显示 ${n} / ${total} 项` +
+    (state.citStatus || state.citType || state.citKw.trim() ? "（已筛选）" : "");
+}
+
+function renderCitationCard(it) {
+  const labels = state.cit.ref_type_labels || {};
+  const srcPara = state.cit.new_paragraphs[it.source_para_idx] || "";
+
+  const body = h("div", { class: "card-body" });
+
+  // 来源：高亮引用片段
+  body.append(
+    h("div", { class: "cite-source" },
+      h("b", {}, "来源　"),
+      h("span", { class: "cite-loc" }, it.source_location),
+      h("div", { class: "cite-quote" }, highlightMention(srcPara, it.source_start, it.source_end))));
+
+  if (it.status === "ok") {
+    body.append(h("div", { class: "cite-target ok" },
+      h("b", {}, "目标　"),
+      h("span", { class: "cite-target-label" }, it.target_label),
+      h("div", { class: "cite-quote" }, ...it.targets.map(t =>
+        h("div", { class: "target-unit" },
+          h("div", { class: "target-tag" }, t.label, ` · 新版第 ${t.para_idx + 1} 段`),
+          h("div", { class: "target-text" }, t.excerpt))))));
+  } else if (it.status === "missing") {
+    body.append(h("div", { class: "cite-target missing" },
+      h("b", {}, "目标　"),
+      h("span", { class: "cite-why" }, "缺失：" + it.reason)));
+  } else {
+    body.append(h("div", { class: "cite-target ambiguous" },
+      h("b", {}, "候选　"),
+      h("span", { class: "cite-why" },
+        `歧义：发现 ${it.candidates.length} 个候选，不自动选取。${it.reason}`),
+      h("div", { class: "cite-cands" }, ...it.candidates.map(c =>
+        h("div", { class: "target-unit cand" },
+          h("div", { class: "target-tag" }, c.label),
+          h("div", { class: "target-text" }, c.excerpt))))));
+  }
+
+  return h("div", { class: `align-card cit-card ${it.status}` },
+    h("div", { class: "card-head" },
+      h("span", { class: `cite-badge ${it.status}` }, CITE_STATUS_LABEL[it.status]),
+      h("span", { class: "cite-mention" }, it.mention_text),
+      h("span", { class: "cite-type" }, labels[it.ref_type] || it.ref_type),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn sm", onclick: () => openCitationModal(it.id) }, "查看来源 / 目标原文")),
+    body);
+}
+
+// 高亮来源段落中的引用片段（按字符偏移切片）
+function highlightMention(text, start, end) {
+  if (start == null || start < 0 || end > text.length) return document.createTextNode(text);
+  const frag = document.createDocumentFragment();
+  frag.append(
+    document.createTextNode(text.slice(0, start)),
+    h("mark", { class: "cite-mark" }, text.slice(start, end)),
+    document.createTextNode(text.slice(end)));
+  return frag;
+}
+
+// ---------------- 引用详情模态框（来源 ↔ 目标/候选原文对照） ----------------
+
+async function openCitationModal(issueId) {
+  let it;
+  try {
+    it = await api(`/api/documents/${state.doc.id}/citations/${issueId}`);
+  } catch (e) { return toast(e.message, true); }
+  const labels = state.cit.ref_type_labels || {};
+  const root = document.getElementById("modal-root");
+  const close = () => { root.innerHTML = ""; };
+
+  const srcText = it.source_para ? it.source_para.content : "";
+  const srcBox = h("div", { class: "text-box new" },
+    h("h4", {}, `来源 · ${it.source_location}`),
+    h("div", { class: "cite-quote" }, highlightMention(srcText, it.source_start, it.source_end)));
+
+  let targetBox;
+  if (it.status === "ok") {
+    targetBox = h("div", { class: "text-box tgt-ok" },
+      h("h4", {}, `唯一定位目标 · ${it.target_label}`),
+      ...it.targets.map(t => h("div", { class: "target-unit" },
+        h("div", { class: "target-tag" }, `${t.label} · 新版第 ${t.para_idx + 1} 段`),
+        h("div", { class: "target-text" }, t.excerpt))));
+  } else if (it.status === "missing") {
+    targetBox = h("div", { class: "text-box tgt-missing" },
+      h("h4", {}, "缺失（未找到目标，未静默选取）"),
+      h("div", { class: "cite-why" }, it.reason));
+  } else {
+    targetBox = h("div", { class: "text-box tgt-amb" },
+      h("h4", {}, `歧义（${it.candidates.length} 个候选，需人工确认）`),
+      ...it.candidates.map(c => h("div", { class: "target-unit cand" },
+        h("div", { class: "target-tag" }, c.label),
+        h("div", { class: "target-text" }, c.excerpt))));
+  }
+
+  const modal = h("div", { class: "modal-mask", onclick: (e) => { if (e.target === e.currentTarget) close(); } },
+    h("div", { class: "modal" },
+      h("div", { class: "modal-head" },
+        h("h3", {}, "引用详情 · ",
+          h("span", { class: `cite-badge ${it.status}` }, CITE_STATUS_LABEL[it.status]),
+          "　", h("span", { class: "cite-mention" }, it.mention_text)),
+        h("button", { class: "close-x", onclick: close }, "✕")),
+      h("div", { class: "modal-body" },
+        h("p", { class: "hint", style: "margin-top:0" },
+          "引用类型：" + (labels[it.ref_type] || it.ref_type) + "　|　判定说明：" + it.reason),
+        h("div", { class: "side-by-side" }, srcBox, targetBox)),
+      h("div", { class: "modal-foot" },
+        h("button", { class: "btn primary", onclick: close }, "关闭"))));
+  root.append(modal);
 }
 
 function applyListFilter() {
@@ -521,13 +791,23 @@ const DEMO_NEW = `第一条 为规范公司经营管理，保障员工合法权�
 
 第三条 员工请假应当至少提前一个工作日通过系统提交申请。
 
-第四条 请假经直接主管批准后方可休假；未经批准不到岗的，视为旷工。
+第四条 请假经直接主管批准后方可休假；未经批准不到岗的，按前款规定处理。
 
-第五条 工资于每月十五日发放，遇节假日顺延。
+第五条 工资于每月十五日发放，遇节假日顺延；发放标准见第八条第二款第（一）项。
 
 第六条 公司为员工缴纳社会保险和住房公积金。
 
-第七条 本制度自发布之日起施行。`;
+第七条 前条规定的缴费基数按国家规定执行；本条未尽事宜按照第十二条办理。
+
+第八条 薪酬构成。
+（一）基本工资；
+（二）绩效奖金。
+
+第二款 绩效奖金按月考核发放。
+
+第九条 对违反第十条的行为，公司有权追究责任。
+
+第十条 本制度自发布之日起施行。`;
 
 // ---------------- 启动 ----------------
 document.getElementById("nav-list").addEventListener("click", renderList);

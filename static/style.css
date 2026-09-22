@@ -302,3 +302,78 @@ textarea { resize: vertical; min-height: 260px; font-family: ui-monospace, "SFMo
   .grid-2, .side-by-side { grid-template-columns: 1fr; }
   .toolbar input[type=text] { width: 100%; }
 }
+
+/* ---------- 工作区 Tab ---------- */
+.tabs { display: flex; gap: 8px; margin-top: 16px; border-bottom: 1px solid var(--border); }
+.tab {
+  border: none; background: none; padding: 10px 16px; cursor: pointer;
+  font: inherit; font-size: 14px; font-weight: 600; color: var(--muted);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tab:hover { color: var(--accent); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-count {
+  font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 999px;
+  background: var(--unchanged-soft); color: var(--unchanged);
+}
+.tab-count.warn { background: var(--old-soft); color: var(--old); }
+.tab-count.ok { background: var(--new-soft); color: var(--new); }
+.tab-panel { margin-top: 18px; }
+
+/* ---------- 文档列表引用角标 ---------- */
+.cit-warn { color: var(--old); font-weight: 700; }
+.cit-ok { color: var(--new); font-weight: 600; }
+
+/* ---------- 引用检查 ---------- */
+.cit-headline { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+.cit-headline b { font-size: 14px; }
+
+.chip.cit-chip.all { background: var(--unchanged-soft); color: var(--unchanged); }
+.chip.cit-chip.missing { background: var(--old-soft); color: var(--old); }
+.chip.cit-chip.ambiguous { background: var(--warn-soft); color: var(--warn); }
+.chip.cit-chip.ok { background: var(--new-soft); color: var(--new); }
+
+.cit-card { border-left-width: 4px; }
+.cit-card.missing { border-left-color: var(--old); }
+.cit-card.ambiguous { border-left-color: var(--warn); }
+.cit-card.ok { border-left-color: var(--new); }
+
+.cite-badge { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.cite-badge.ok { background: var(--new-soft); color: var(--new); }
+.cite-badge.missing { background: var(--old-soft); color: var(--old); }
+.cite-badge.ambiguous { background: var(--warn-soft); color: var(--warn); }
+.cite-mention { font-weight: 700; font-size: 14px; }
+.cite-type { font-size: 12px; color: var(--muted); }
+
+.cite-source { margin-bottom: 10px; }
+.cite-loc { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.cite-quote {
+  margin-top: 6px; background: #fafbfc; border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 14px; white-space: pre-wrap; word-break: break-word;
+  font-size: 13.5px;
+}
+.cite-mark { background: #fde68a; color: #92400e; padding: 0 3px; border-radius: 3px; font-weight: 700; }
+
+.cite-target { border-top: 1px dashed var(--border); padding-top: 10px; }
+.cite-target-label { font-weight: 700; color: var(--new); margin-left: 6px; }
+.cite-why { margin-left: 6px; font-size: 13px; }
+.cite-target.missing .cite-why { color: var(--old); }
+.cite-target.ambiguous .cite-why { color: var(--warn); }
+
+.target-unit { margin-top: 8px; }
+.target-tag { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 2px; }
+.target-unit.cand .target-tag { color: var(--warn); }
+.target-text { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; }
+.cite-cands { margin-top: 6px; display: grid; gap: 8px; }
+.cite-cands .target-unit {
+  background: var(--warn-soft); border: 1px solid #fde68a; border-radius: 8px; padding: 8px 12px;
+}
+
+.text-box.tgt-ok { background: var(--new-soft); border-color: #bbf7d0; }
+.text-box.tgt-ok h4 { color: var(--new); }
+.text-box.tgt-missing { background: var(--old-soft); border-color: #fecaca; }
+.text-box.tgt-missing h4 { color: var(--old); }
+.text-box.tgt-amb { background: var(--warn-soft); border-color: #fde68a; }
+.text-box.tgt-amb h4 { color: var(--warn); }
+
