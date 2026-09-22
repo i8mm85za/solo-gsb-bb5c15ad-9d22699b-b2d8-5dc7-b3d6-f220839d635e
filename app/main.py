@@ -1,4 +1,4 @@
-"""FastAPI 入口：文档上传、对齐、审阅决定、手动调整、导出。
+"""FastAPI 入口：文档上传、对齐、审阅决定、手动调整、引用检查、导出。
 
 启动时初始化 SQLite；静态前端挂载在 /，页面访问 8000 端口。
 """
@@ -18,7 +18,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import database as dbmod
 from .aligner import align, manual_record, split_paragraphs
-from .database import db, indices_to_str, row_to_dict
+from .database import db, indices_to_str, row_to_dict, str_to_indices
+from .refcheck import check_references
 from .schemas import (
     AlignmentCreate,
     AlignmentPatch,
@@ -51,6 +52,15 @@ DECISIONS = {
     "disputed": "有异议",
     "ignored": "忽略",
 }
+REF_STATUS = {
+    "ok": "正常",
+    "missing": "缺失",
+    "ambiguous": "歧义",
+}
+REF_KIND = {
+    "absolute": "绝对引用",
+    "relative": "相对引用",
+}
 
 
 @app.on_event("startup")
@@ -59,6 +69,28 @@ def _startup() -> None:
 
 
 # ---------------- 文档 ----------------
+
+def _run_refcheck(conn, doc_id: int) -> tuple[int, int]:
+    """对文档新版段落执行引用检查并重建 ref_checks。返回 (引用总数, 问题数)。"""
+    new_paras = [r[0] for r in conn.execute(
+        "SELECT content FROM paragraphs WHERE document_id=? AND side='new' ORDER BY idx",
+        (doc_id,)).fetchall()]
+    results = check_references(new_paras)
+    conn.execute("DELETE FROM ref_checks WHERE document_id=?", (doc_id,))
+    conn.executemany(
+        """INSERT INTO ref_checks
+           (document_id, source_idx, ref_text, ref_kind, position,
+            target_indices, candidates, status, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(doc_id, r["source_idx"], r["ref_text"], r["ref_kind"], r["position"],
+          indices_to_str(r["target_indices"]), indices_to_str(r["candidates"]),
+          r["status"], r["detail"]) for r in results],
+    )
+    conn.execute("UPDATE documents SET ref_checked_at=datetime('now') WHERE id=?",
+                 (doc_id,))
+    issues = sum(1 for r in results if r["status"] != "ok")
+    return len(results), issues
+
 
 @app.post("/api/documents", status_code=201)
 def create_document(payload: DocumentCreate):
@@ -93,7 +125,8 @@ def create_document(payload: DocumentCreate):
                  json.dumps(r["diff_ops"], ensure_ascii=False)),
             )
         conn.execute("UPDATE documents SET aligned_at = datetime('now') WHERE id = ?", (doc_id,))
-    return {"id": doc_id, "aligned": len(records)}
+        _, ref_issues = _run_refcheck(conn, doc_id)
+    return {"id": doc_id, "aligned": len(records), "ref_issues": ref_issues}
 
 
 @app.get("/api/documents")
@@ -104,7 +137,8 @@ def list_documents():
                       (SELECT COUNT(*) FROM paragraphs p WHERE p.document_id=d.id AND p.side='old') AS n_old,
                       (SELECT COUNT(*) FROM paragraphs p WHERE p.document_id=d.id AND p.side='new') AS n_new,
                       (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id) AS n_align,
-                      (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id AND a.decision!='pending') AS n_reviewed
+                      (SELECT COUNT(*) FROM alignments a WHERE a.document_id=d.id AND a.decision!='pending') AS n_reviewed,
+                      (SELECT COUNT(*) FROM ref_checks r WHERE r.document_id=d.id AND r.status!='ok') AS n_ref_issues
                FROM documents d ORDER BY d.created_at DESC, d.id DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
@@ -128,11 +162,15 @@ def get_document(doc_id: int):
         aligns = conn.execute(
             "SELECT * FROM alignments WHERE document_id=? ORDER BY id", (doc_id,)
         ).fetchall()
+        n_ref_issues = conn.execute(
+            "SELECT COUNT(*) FROM ref_checks WHERE document_id=? AND status!='ok'",
+            (doc_id,)).fetchone()[0]
     paragraphs = {"old": [], "new": []}
     for p in paras:
         paragraphs[p["side"]].append({"idx": p["idx"], "content": p["content"]})
     result = dict(doc)
     result["paragraphs"] = paragraphs
+    result["n_ref_issues"] = n_ref_issues
     result["alignments"] = []
     for r in aligns:
         a = row_to_dict(r)
@@ -321,6 +359,109 @@ def realign(doc_id: int):
             )
         conn.execute("UPDATE documents SET aligned_at=datetime('now') WHERE id=?", (doc_id,))
     return {"detail": "已重新对齐", "count": len(records)}
+
+
+# ---------------- 引用检查 ----------------
+
+_REF_STATUSES = ("ok", "missing", "ambiguous")
+
+
+def _parse_status_filter(status: str | None) -> tuple[str, ...] | None:
+    """status 查询参数 → 状态元组；None / 空 / 'all' 表示不过滤。"""
+    if status is None or status in ("", "all"):
+        return None
+    parts = tuple(s for s in status.split(",") if s)
+    invalid = [s for s in parts if s not in _REF_STATUSES]
+    if invalid:
+        raise HTTPException(422, f"非法的检查状态：{'、'.join(invalid)}")
+    return parts or None
+
+
+def _refcheck_payload(conn, doc_id: int, doc, statuses: tuple[str, ...] | None) -> dict:
+    """组装引用检查响应：汇总计数 + 明细（含来源/目标/候选段落原文）。"""
+    paras = {r["idx"]: r["content"] for r in conn.execute(
+        "SELECT idx, content FROM paragraphs WHERE document_id=? AND side='new'",
+        (doc_id,)).fetchall()}
+    rows = conn.execute(
+        "SELECT * FROM ref_checks WHERE document_id=? ORDER BY source_idx, position, id",
+        (doc_id,)).fetchall()
+    summary = {"ok": 0, "missing": 0, "ambiguous": 0}
+    items = []
+    for r in rows:
+        d = dict(r)
+        summary[d["status"]] += 1
+        if statuses and d["status"] not in statuses:
+            continue
+        d["target_indices"] = str_to_indices(d["target_indices"])
+        d["candidates"] = str_to_indices(d["candidates"])
+        d["source_text"] = paras.get(d["source_idx"], "")
+        d["targets"] = [{"idx": i, "content": paras.get(i, "")}
+                        for i in d["target_indices"]]
+        d["candidate_paras"] = [{"idx": i, "content": paras.get(i, "")}
+                                for i in d["candidates"]]
+        items.append(d)
+    return {
+        "checked": doc["ref_checked_at"] is not None,
+        "checked_at": doc["ref_checked_at"],
+        "summary": summary,
+        "total": len(rows),
+        "items": items,
+    }
+
+
+@app.get("/api/documents/{doc_id}/refcheck")
+def get_refcheck(doc_id: int, status: str | None = None):
+    """引用检查结果。status 可逗号分隔多值（ok,missing,ambiguous），缺省返回全部。"""
+    statuses = _parse_status_filter(status)
+    with db() as conn:
+        doc = _get_doc_or_404(conn, doc_id)
+        return _refcheck_payload(conn, doc_id, doc, statuses)
+
+
+@app.post("/api/documents/{doc_id}/refcheck")
+def rerun_refcheck(doc_id: int):
+    """重新扫描新版文本并重建引用检查结果（不影响对齐与审阅数据）。"""
+    with db() as conn:
+        _get_doc_or_404(conn, doc_id)
+        total, issues = _run_refcheck(conn, doc_id)
+        doc = _get_doc_or_404(conn, doc_id)
+        payload = _refcheck_payload(conn, doc_id, doc, None)
+    payload["detail"] = f"引用检查完成：共 {total} 处引用，问题 {issues} 处"
+    return payload
+
+
+@app.get("/api/documents/{doc_id}/refcheck/export")
+def export_refcheck(doc_id: int, status: str | None = None):
+    """引用问题 CSV 导出：缺省仅导出「缺失 + 歧义」问题项；status=all 导出全部。"""
+    statuses = ("missing", "ambiguous") if not status else _parse_status_filter(status)
+    with db() as conn:
+        doc = _get_doc_or_404(conn, doc_id)
+        payload = _refcheck_payload(conn, doc_id, doc, statuses)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["序号", "检查状态", "来源段落（新版）", "引用原文", "引用类型",
+                     "目标段落（新版）", "候选段落（歧义）", "定位说明",
+                     "来源原文", "目标/候选原文"])
+    for i, it in enumerate(payload["items"], 1):
+        writer.writerow([
+            i,
+            REF_STATUS[it["status"]],
+            f"第 {it['source_idx'] + 1} 段",
+            it["ref_text"],
+            REF_KIND[it["ref_kind"]],
+            "、".join(f"第 {t['idx'] + 1} 段" for t in it["targets"]) or "—",
+            "、".join(f"第 {c['idx'] + 1} 段" for c in it["candidate_paras"]) or "—",
+            it["detail"],
+            it["source_text"],
+            "\n---\n".join([t["content"] for t in it["targets"]]
+                           or [c["content"] for c in it["candidate_paras"]]) or "—",
+        ])
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 加 UTF-8 BOM，便于 Excel 直接打开中文
+    data = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
+    return Response(content=data, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=refcheck-{doc_id}-{stamp}.csv"})
 
 
 # ---------------- 导出 ----------------

@@ -8,6 +8,8 @@ const TYPE_LABEL = {
 const DECISION_LABEL = {
   pending: "待审阅", confirmed: "确认", disputed: "有异议", ignored: "忽略",
 };
+const REF_STATUS_LABEL = { ok: "正常", missing: "缺失", ambiguous: "歧义" };
+const REF_KIND_LABEL = { absolute: "绝对引用", relative: "相对引用" };
 
 const state = {
   view: "list",           // list | upload | workspace
@@ -15,6 +17,10 @@ const state = {
   filterType: "",         // 变更类型筛选
   filterDecision: "",     // 决定筛选
   search: "",
+  wsTab: "align",         // 工作区页签：align | refs
+  refs: null,             // 引用检查结果
+  refFilter: "",          // 引用状态筛选（"" 全部）
+  refOpen: new Set(),     // 已展开原文的引用记录 id
 };
 
 const $app = document.getElementById("app");
@@ -90,6 +96,9 @@ async function renderList() {
                 h("span", {}, `新版 ${d.n_new} 段`),
                 h("span", {}, `对齐 ${d.n_align} 条`),
                 h("span", {}, `已审阅 ${d.n_reviewed}/${d.n_align}`),
+                d.ref_checked_at
+                  ? h("span", {}, d.n_ref_issues ? `引用问题 ${d.n_ref_issues}` : "引用检查通过")
+                  : null,
                 h("span", {}, `创建于 ${fmtTime(d.created_at)}`))),
             h("button", {
               class: "btn danger sm",
@@ -141,7 +150,8 @@ function renderUpload() {
                 method: "POST",
                 body: JSON.stringify({ title, old_text: oldEl.value, new_text: newEl.value }),
               });
-              toast(`已生成 ${r.aligned} 条对齐候选`);
+              toast(`已生成 ${r.aligned} 条对齐候选` +
+                (r.ref_issues ? `，发现引用问题 ${r.ref_issues} 处` : ""));
               openDoc(r.id);
             } catch (e) { toast(e.message, true); }
           },
@@ -158,13 +168,17 @@ function renderUpload() {
 
 // ---------------- 视图：审阅工作区 ----------------
 
-async function openDoc(id) {
+async function openDoc(id, tab) {
   try {
     state.doc = await api(`/api/documents/${id}`);
   } catch (e) { return toast(e.message, true); }
   state.filterType = "";
   state.filterDecision = "";
   state.search = "";
+  state.wsTab = tab || "align";
+  state.refs = null;
+  state.refFilter = "";
+  state.refOpen = new Set();
   state.view = "workspace";
   document.getElementById("nav-list").classList.remove("active");
   document.getElementById("nav-upload").classList.remove("active");
@@ -223,6 +237,20 @@ function renderWorkspace() {
       h("span", { class: "foot-label", id: "visible-count" })));
 
   $app.append(head);
+
+  // 页签：对齐审阅 / 引用检查
+  const nIssues = d.n_ref_issues || 0;
+  $app.append(h("div", { class: "ws-tabs" },
+    h("button", {
+      class: `ws-tab ${state.wsTab === "align" ? "active" : ""}`,
+      onclick: () => { state.wsTab = "align"; renderWorkspace(); },
+    }, "对齐审阅"),
+    h("button", {
+      class: `ws-tab ${state.wsTab === "refs" ? "active" : ""}`,
+      onclick: () => { state.wsTab = "refs"; renderWorkspace(); },
+    }, nIssues ? `引用检查（问题 ${nIssues}）` : "引用检查")));
+
+  if (state.wsTab === "refs") { renderRefView(); return; }
 
   const list = h("div", { id: "alignment-list" });
   d.alignments.forEach(a => list.appendChild(renderCard(a)));
@@ -286,6 +314,172 @@ function applyListFilter() {
   const el = document.getElementById("visible-count");
   if (el) el.textContent = `显示 ${n} / ${state.doc.alignments.length} 条` +
     (state.filterType || state.filterDecision || kw ? "（已筛选）" : "");
+}
+
+// ---------------- 引用检查 ----------------
+
+async function renderRefView() {
+  const d = state.doc;
+  const panel = h("div", { class: "panel" }, h("p", { class: "hint" }, "正在加载引用检查结果…"));
+  $app.append(panel);
+
+  let data;
+  try { data = await api(`/api/documents/${d.id}/refcheck`); }
+  catch (e) {
+    panel.innerHTML = "";
+    panel.append(h("div", { class: "empty" }, `加载失败：${e.message}`));
+    return;
+  }
+  state.refs = data;
+  panel.innerHTML = "";
+
+  if (!data.checked) {
+    panel.append(h("div", { class: "empty" },
+      h("p", {}, "尚未运行引用检查"),
+      h("p", { class: "hint" },
+        "扫描新版文本中的条款引用（第X条 / 第X条第Y款 / 本条 / 前款 / 上一条 等），校验其指向是否存在且唯一。"),
+      h("button", { class: "btn primary", onclick: runRefcheck }, "▶ 运行引用检查")));
+    return;
+  }
+
+  panel.append(
+    h("div", { class: "workspace-head" },
+      h("div", {},
+        h("h2", {}, "引用检查"),
+        h("div", { class: "doc-meta" },
+          h("span", {}, `共 ${data.total} 处引用`),
+          h("span", {}, `正常 ${data.summary.ok}`),
+          h("span", {}, `缺失 ${data.summary.missing}`),
+          h("span", {}, `歧义 ${data.summary.ambiguous}`),
+          data.checked_at ? h("span", {}, `检查时间 ${fmtTime(data.checked_at)}`) : null)),
+      h("div", { class: "actions", style: "margin:0" },
+        h("button", { class: "btn sm", onclick: runRefcheck }, "↻ 重新检查"),
+        h("button", { class: "btn primary sm", onclick: exportRefs }, "⬇ 导出引用问题 CSV"))),
+    h("p", { class: "hint" },
+      "按新版段落结构（条 → 款）定位引用目标：无法定位标记「缺失」，存在多个候选标记「歧义」（不静默选取）。" +
+      "点击条目可展开来源与目标（或候选）原文。"),
+    h("div", { class: "stats", id: "ref-chips" }),
+    h("div", { id: "ref-list" }));
+  renderRefChips();
+  renderRefList();
+}
+
+function renderRefChips() {
+  const box = document.getElementById("ref-chips");
+  if (!box || !state.refs) return;
+  const s = state.refs.summary;
+  const defs = [
+    ["", "全部", state.refs.total],
+    ["ok", REF_STATUS_LABEL.ok, s.ok],
+    ["missing", REF_STATUS_LABEL.missing, s.missing],
+    ["ambiguous", REF_STATUS_LABEL.ambiguous, s.ambiguous],
+  ];
+  box.innerHTML = "";
+  for (const [key, label, n] of defs) {
+    box.append(h("span", {
+      class: `chip clickable ${key || "all"} ${state.refFilter === key ? "" : "off"}`,
+      onclick: () => { state.refFilter = key; renderRefChips(); renderRefList(); },
+    }, key ? h("span", { class: "dot" }) : null, `${label} ${n}`));
+  }
+}
+
+function renderRefList() {
+  const box = document.getElementById("ref-list");
+  if (!box || !state.refs) return;
+  box.innerHTML = "";
+  const items = state.refs.items.filter(it => !state.refFilter || it.status === state.refFilter);
+  if (!items.length) {
+    box.append(h("div", { class: "empty" },
+      state.refs.total === 0 ? "新版文本中未发现任何条款引用" : "当前筛选条件下没有记录"));
+    return;
+  }
+  for (const it of items) box.append(renderRefCard(it));
+}
+
+function renderRefCard(it) {
+  const expanded = state.refOpen.has(it.id);
+  const targetLabel = it.status === "ambiguous"
+    ? `候选：${it.candidate_paras.map(c => `第 ${c.idx + 1} 段`).join("、")}`
+    : it.targets.length
+      ? `→ ${it.targets.map(t => `第 ${t.idx + 1} 段`).join("、")}`
+      : "无目标";
+
+  const card = h("div", { class: `ref-card ${it.status}` },
+    h("div", { class: "card-head", onclick: () => toggleRef(it.id) },
+      h("span", { class: `badge ${it.status}` }, REF_STATUS_LABEL[it.status]),
+      h("span", { class: "ref-src" }, `新版第 ${it.source_idx + 1} 段`),
+      h("span", { class: "ref-quote" }, `「${it.ref_text}」`),
+      h("span", { class: "ref-kind" }, REF_KIND_LABEL[it.ref_kind]),
+      h("span", { class: "spacer" }),
+      h("span", { class: "ref-target" }, targetLabel),
+      h("button", {
+        class: "btn sm",
+        onclick: (e) => { e.stopPropagation(); toggleRef(it.id); },
+      }, expanded ? "收起原文" : "查看原文")),
+    h("div", { class: "ref-detail" }, it.detail));
+  if (expanded) card.appendChild(renderRefTexts(it));
+  return card;
+}
+
+function toggleRef(id) {
+  state.refOpen.has(id) ? state.refOpen.delete(id) : state.refOpen.add(id);
+  renderRefList();
+}
+
+// 来源 / 目标（或候选）原文对照
+function renderRefTexts(it) {
+  const srcBox = h("div", { class: "text-box old" },
+    h("h4", {}, `来源 · 新版第 ${it.source_idx + 1} 段`),
+    h("div", {}, ...highlightRef(it.source_text, it.ref_text, it.position)));
+
+  let dstBox;
+  if (it.status === "ambiguous") {
+    dstBox = h("div", { class: "text-box new" },
+      h("h4", {}, `候选目标（${it.candidate_paras.length} 个，需人工确认）`),
+      ...it.candidate_paras.flatMap(c => [
+        h("div", { class: "ref-cand-label" }, `第 ${c.idx + 1} 段`),
+        h("div", { class: "ref-cand" }, c.content),
+      ]));
+  } else if (it.targets.length) {
+    dstBox = h("div", { class: "text-box new" },
+      h("h4", {}, `目标 · ${it.targets.map(t => `第 ${t.idx + 1} 段`).join("、")}`),
+      ...it.targets.flatMap(t => [
+        h("div", { class: "ref-cand-label" }, `第 ${t.idx + 1} 段`),
+        h("div", { class: "ref-cand" }, t.content),
+      ]));
+  } else {
+    dstBox = h("div", { class: "text-box empty-box" },
+      h("h4", {}, "目标 · 缺失"), "（未能在新版文本中定位到引用目标）");
+  }
+  return h("div", { class: "ref-texts" }, srcBox, dstBox);
+}
+
+// 在来源段落中高亮引用原文（优先使用记录的位置偏移）
+function highlightRef(text, ref, pos) {
+  let i = -1;
+  if (pos != null && text.slice(pos, pos + ref.length) === ref) i = pos;
+  else i = text.indexOf(ref);
+  if (i < 0) return [document.createTextNode(text)];
+  return [
+    document.createTextNode(text.slice(0, i)),
+    h("mark", {}, ref),
+    document.createTextNode(text.slice(i + ref.length)),
+  ];
+}
+
+async function runRefcheck() {
+  try {
+    const r = await api(`/api/documents/${state.doc.id}/refcheck`, { method: "POST" });
+    toast(r.detail || "引用检查完成");
+    await openDoc(state.doc.id, "refs");
+  } catch (e) { toast(e.message, true); }
+}
+
+function exportRefs() {
+  // 未筛选时导出「缺失 + 歧义」问题项；处于某一状态筛选时仅导出该状态
+  const p = new URLSearchParams();
+  if (state.refFilter) p.set("status", state.refFilter);
+  window.location.href = `/api/documents/${state.doc.id}/refcheck/export?${p.toString()}`;
 }
 
 // ---------------- 对齐记录卡片 ----------------

@@ -17,12 +17,13 @@ if not DB_PATH.parent.exists():  # 本地裸跑（无 /data）时回退到仓库
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    title        TEXT    NOT NULL,
-    old_text     TEXT    NOT NULL DEFAULT '',
-    new_text     TEXT    NOT NULL DEFAULT '',
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    aligned_at   TEXT
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    title          TEXT    NOT NULL,
+    old_text       TEXT    NOT NULL DEFAULT '',
+    new_text       TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    aligned_at     TEXT,
+    ref_checked_at TEXT                       -- 最近一次引用检查时间，NULL 表示未检查
 );
 
 CREATE TABLE IF NOT EXISTS paragraphs (
@@ -55,8 +56,23 @@ CREATE TABLE IF NOT EXISTS alignments (
     decided_at     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ref_checks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id    INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    source_idx     INTEGER NOT NULL,            -- 来源段落（新版，0 基）
+    ref_text       TEXT    NOT NULL,            -- 引用原文，如「第十条第二款」
+    ref_kind       TEXT    NOT NULL CHECK (ref_kind IN ('absolute', 'relative')),
+    position       INTEGER NOT NULL DEFAULT 0,  -- 在来源段落中的字符偏移
+    target_indices TEXT    NOT NULL DEFAULT '', -- 定位到的新版段落序号（逗号分隔）
+    candidates     TEXT    NOT NULL DEFAULT '', -- 歧义时的全部候选段落序号
+    status         TEXT    NOT NULL CHECK (status IN ('ok', 'missing', 'ambiguous')),
+    detail         TEXT    NOT NULL DEFAULT '', -- 中文定位说明
+    created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_paragraphs_doc ON paragraphs(document_id, side, idx);
 CREATE INDEX IF NOT EXISTS idx_alignments_doc ON alignments(document_id);
+CREATE INDEX IF NOT EXISTS idx_ref_checks_doc ON ref_checks(document_id, status);
 """
 
 
@@ -80,11 +96,19 @@ def db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量迁移：为既有数据库补充新增列（幂等）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "ref_checked_at" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN ref_checked_at TEXT")
+
+
 def init_db() -> None:
-    """创建数据目录与全部表（幂等），容器入口调用。"""
+    """创建数据目录与全部表（幂等），容器入口调用；含轻量列迁移。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def indices_to_str(indices: list[int]) -> str:
