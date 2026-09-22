@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地数据库（容器内使用 /data 卷，不在仓库内）
+data/
+*.db

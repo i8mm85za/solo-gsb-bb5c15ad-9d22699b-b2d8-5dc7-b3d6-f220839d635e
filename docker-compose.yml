@@ -1,0 +1,18 @@
+services:
+  regreview:
+    build: .
+    image: regreview:latest
+    container_name: regreview
+    ports:
+      - "8000:8000"
+    volumes:
+      - regreview-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  regreview-data:
